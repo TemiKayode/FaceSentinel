@@ -1,0 +1,448 @@
+# -----------------------------------------------------------------------------
+# Consent-Based Biometric Auth Worker - Kubernetes Deployment
+# Service: auth-worker  |  Region: us-east-1  |  Node pool: g5.xlarge (A10G)
+#
+# Key architectural changes from the passive ingestion design:
+#   - Consumes auth.requests (user-initiated) not frames.raw (passive capture)
+#   - Publishes to auth.responses (decision per transaction)
+#   - DLQ topic for malformed / unprocessable requests
+#   - Health probes differentiate model-loading (/startupz) from readiness (/readyz)
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-worker
+  namespace: biometric-auth
+  labels:
+    app: auth-worker
+    region: us-east-1
+    data-classification: biometric-pii
+    consent-model: user-initiated
+spec:
+  replicas: 2                           # KEDA ScaledObject overrides this at runtime
+  selector:
+    matchLabels:
+      app: auth-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 2
+  template:
+    metadata:
+      labels:
+        app: auth-worker
+        region: us-east-1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        # Vault agent injects secrets as env vars via annotation
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "auth-worker"
+    spec:
+      serviceAccountName: auth-worker-sa
+      priorityClassName: auth-high-priority
+      # Allow in-flight auth transactions to complete before pod terminates.
+      # Must be > max_poll_interval_ms (60 s) + inference latency budget.
+      terminationGracePeriodSeconds: 90
+
+      # -- Node affinity: GPU nodes in this region only ------------------
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: [g5.xlarge, g5.2xlarge]
+                  - key: topology.kubernetes.io/region
+                    operator: In
+                    values: [us-east-1]
+        # Spread replicas across physical hosts for HA
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: auth-worker
+                topologyKey: kubernetes.io/hostname
+
+      # -- Pod-level security context ------------------------------------
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      # -- Init container: validate GPU is available before loading model -
+      initContainers:
+        - name: gpu-check
+          image: nvidia/cuda:12.2.0-base-ubuntu22.04
+          command:
+            - nvidia-smi
+            - "--query-gpu=name,memory.total,memory.free"
+            - "--format=csv,noheader"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+
+      containers:
+        - name: auth-worker
+          image: 123456789.dkr.ecr.us-east-1.amazonaws.com/auth-worker:3.0.0
+          imagePullPolicy: Always
+
+          # -- Container security hardening -------------------------------
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+          # -- Resource allocation ----------------------------------------
+          # ArcFace R100 (buffalo_l): ~1.5 GB VRAM at inference
+          # 12 Gi memory: model weights + batch numpy buffers + aiohttp
+          resources:
+            requests:
+              cpu: "4"
+              memory: "12Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "20Gi"
+              nvidia.com/gpu: "1"
+
+          # -- Environment ------------------------------------------------
+          env:
+            - name: REGION
+              value: "us-east-1"
+
+            # Kafka
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: auth-config
+                  key: kafka_bootstrap_us
+            - name: KAFKA_REQUEST_TOPIC
+              value: "auth.requests"
+            - name: KAFKA_RESPONSE_TOPIC
+              value: "auth.responses"
+            - name: KAFKA_DLQ_TOPIC
+              value: "auth.requests.dlq"
+            - name: KAFKA_AUDIT_TOPIC
+              value: "auth.audit"
+            - name: KAFKA_GROUP_ID
+              value: "auth-worker-us"
+            - name: KAFKA_SCHEMA_REGISTRY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: auth-config
+                  key: schema_registry_url
+            - name: KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: username
+            - name: KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kafka-credentials
+                  key: password
+
+            # Qdrant (read-only against enrolled_faces)
+            - name: QDRANT_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: auth-config
+                  key: qdrant_host_us
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: qdrant-credentials
+                  key: api_key
+            - name: QDRANT_ENROLLED_COLLECTION
+              value: "enrolled_faces"
+            - name: QDRANT_HTTPS
+              value: "true"
+
+            # Verification thresholds
+            - name: MATCH_THRESHOLD
+              value: "0.75"
+            - name: DET_SCORE_MIN
+              value: "0.85"
+            - name: INFERENCE_TIMEOUT_S
+              value: "10.0"
+
+            # Liveness (MiniFAS via deepface; requires deepface in image)
+            - name: LIVENESS_CHECK_ENABLED
+              value: "false"
+
+            # Model identity (bump MODEL_VERSION when upgrading InsightFace)
+            - name: MODEL_NAME
+              value: "buffalo_l"
+            - name: MODEL_VERSION
+              value: "insightface-0.7.3"
+
+            # Multi-tenancy (leave empty for single-tenant deployments)
+            - name: TENANT_ID
+              value: ""
+
+            # Security hardening
+            - name: ANOMALY_DETECTION_ENABLED
+              value: "true"
+            - name: AUDIT_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: audit-credentials
+                  key: hmac_secret
+            - name: INSIGHTFACE_ROOT
+              value: "/models/insightface"
+            # Dual-index migration: set during model upgrades, unset once done
+            # - name: QDRANT_ENROLLED_COLLECTION_V2
+            #   value: "enrolled_faces_v2"
+
+            # Rate limiting
+            - name: RATE_LIMIT_MAX
+              value: "10"
+            - name: RATE_LIMIT_WINDOW_S
+              value: "30"
+
+            # Batching
+            - name: WORKER_BATCH_SIZE
+              value: "16"
+            - name: WORKER_BATCH_TIMEOUT_MS
+              value: "100"
+
+            # GPU threading
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0"
+            - name: TORCH_NUM_THREADS
+              value: "4"
+            - name: OMP_NUM_THREADS
+              value: "4"
+
+            # Observability
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_SERVICE_NAME
+              value: "auth-worker-us-east-1"
+            - name: HEALTH_PORT
+              value: "8080"
+
+          # -- Volume mounts ----------------------------------------------
+          volumeMounts:
+            # RAM-backed /tmp - cleared on pod death, never written to node disk
+            - name: tmp-ram
+              mountPath: /tmp
+            # Read-only model weights from PVC backed by EFS
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+            # Shared memory required by CUDA multiprocessing
+            - name: dshm
+              mountPath: /dev/shm
+
+          # -- Probes ----------------------------------------------------
+          # /startupz: passes only once ArcFace weights are loaded into VRAM
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: 8080
+            failureThreshold: 30      # 30 x 10s = 5 min max model load time
+            periodSeconds: 10
+            timeoutSeconds: 3
+
+          # /readyz: passes once Kafka + Qdrant connections are established
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          # /healthz: simple liveness - process is running
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+      volumes:
+        - name: tmp-ram
+          emptyDir:
+            medium: Memory
+            sizeLimit: "2Gi"
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-weights-pvc
+            readOnly: true
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "4Gi"
+
+---
+# -----------------------------------------------------------------------------
+# KEDA ScaledObject - autoscale on auth.requests queue depth
+#
+# Scaling rationale:
+#   - Morning shift change: ~2,000 employees badge-in over 30 minutes
+#     = ~67 requests/sec peak. At 16 req/batch x ~50ms/batch = 320 req/sec
+#     per pod -> 2 pods is sufficient for steady state, 6-8 for burst.
+#   - maxReplicaCount: 50 is the hard ceiling for multi-site global deployments
+#     if all regions share a single KEDA-managed fleet.
+#   - lagThreshold: 200 - scale up when queue depth per partition > 200 msgs.
+# -----------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: auth-worker-scaler
+  namespace: biometric-auth
+spec:
+  scaleTargetRef:
+    name: auth-worker
+  minReplicaCount: 2
+  maxReplicaCount: 50
+  cooldownPeriod: 180               # 3 min cooldown after scale-down
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 15   # react quickly to morning surge
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 300  # hold capacity for 5 min after peak
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: "kafka-us.auth.internal:9092"
+        consumerGroup: auth-worker-us
+        topic: auth.requests
+        lagThreshold: "200"
+        offsetResetPolicy: latest
+      authenticationRef:
+        name: kafka-trigger-auth
+
+---
+# -----------------------------------------------------------------------------
+# TriggerAuthentication - Kafka SASL/SSL credentials injected from Vault
+# -----------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: kafka-trigger-auth
+  namespace: biometric-auth
+spec:
+  secretTargetRef:
+    - parameter: sasl
+      name: kafka-credentials
+      key: sasl_mechanism
+    - parameter: username
+      name: kafka-credentials
+      key: username
+    - parameter: password
+      name: kafka-credentials
+      key: password
+    - parameter: tls
+      name: kafka-credentials
+      key: tls_enabled
+
+---
+# -----------------------------------------------------------------------------
+# PodDisruptionBudget - keep >= 2 pods alive during node upgrades
+# -----------------------------------------------------------------------------
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: auth-worker-pdb
+  namespace: biometric-auth
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: auth-worker
+
+---
+# -----------------------------------------------------------------------------
+# NetworkPolicy - restrict ingress/egress to only required services
+# -----------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-worker-netpol
+  namespace: biometric-auth
+spec:
+  podSelector:
+    matchLabels:
+      app: auth-worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only Prometheus and the K8s control plane may scrape/probe the worker
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+    - from:
+        - namespaceSelector: {}   # K8s probes originate from node kubelet
+      ports:
+        - port: 8080
+  egress:
+    # Kafka brokers
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kafka
+      ports:
+        - port: 9092
+    # Qdrant cluster
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: qdrant
+      ports:
+        - port: 6333
+        - port: 6334
+    # OpenTelemetry collector
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - port: 4317
+    # DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP

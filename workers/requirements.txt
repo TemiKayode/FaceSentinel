@@ -1,0 +1,39 @@
+# ── Core inference ─────────────────────────────────────────────────────────────
+insightface>=0.7.3
+# GPU install (CUDA 12.1):
+#   pip install onnxruntime-gpu torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CPU install (default for local dev):
+onnxruntime>=1.17.0
+torch>=2.1.0
+torchvision>=0.16.0
+opencv-python>=4.9.0.80
+numpy>=1.26.0
+
+# ── Kafka + Avro ───────────────────────────────────────────────────────────────
+confluent-kafka>=2.3.0
+
+# ── Avro / schema registry runtime deps (not declared by confluent-kafka) ──────
+authlib>=1.3.0
+cachetools>=5.3.0
+fastavro>=1.9.0
+httpx>=0.27.0
+
+# ── Vector DB ──────────────────────────────────────────────────────────────────
+qdrant-client>=1.9.0
+
+# ── HTTP / health ──────────────────────────────────────────────────────────────
+aiohttp>=3.9.0
+
+# ── OpenTelemetry ──────────────────────────────────────────────────────────────
+opentelemetry-api>=1.23.0
+opentelemetry-sdk>=1.23.0
+opentelemetry-exporter-otlp-proto-grpc>=1.23.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+Pillow>=10.3.0
+requests>=2.31.0
+
+# ── Optional: passive liveness / anti-spoofing (MiniFAS via DeepFace) ─────────
+# Uncomment and install to enable LIVENESS_CHECK_ENABLED=true in the worker and
+# enrollment script. Adds ~1.5 GB for TF/Torch model weights on first run.
+# deepface>=0.0.93

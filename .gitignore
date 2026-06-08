@@ -1,0 +1,64 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Environment / secrets ──────────────────────────────────────────────────────
+.env
+# .env.local is the safe template — DO commit it; real .env is excluded above
+
+# ── Data / model weights ───────────────────────────────────────────────────────
+data/
+models/
+*.onnx
+*.pt
+*.pth
+*.bin
+*.pkl
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+*.log.*
+logs/
+
+# ── Test face images (real photos — do not commit) ────────────────────────────
+test_faces/*.jpg
+test_faces/*.jpeg
+test_faces/*.png
+test_faces/*.webp
+# Keep the download script that fetches them
+!test_faces/.gitkeep
+
+# ── InsightFace local model cache ─────────────────────────────────────────────
+.insightface/
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Coverage / test artefacts ─────────────────────────────────────────────────
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
